@@ -1,4 +1,5 @@
 use cfg_if::cfg_if;
+use core::arch::asm;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
@@ -112,12 +113,12 @@ impl<'a, T: ?Sized> Drop for SpinLockGuard<'a, T> {
 impl<'a, T: ?Sized> Deref for SpinLockGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &*self.inner
+        &self.inner
     }
 }
 
 impl<'a, T: ?Sized> DerefMut for SpinLockGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut *self.inner
+        &mut self.inner
     }
 }

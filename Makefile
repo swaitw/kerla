@@ -5,6 +5,7 @@ export RELEASE    ?=
 export ARCH       ?= x64
 export LOG        ?=
 export LOG_SERIAL ?=
+export CMDLINE    ?=
 export QEMU_ARGS  ?=
 
 # The default build target.
@@ -22,13 +23,15 @@ endif
 
 # $(IMAGE): Use a Docker image for initramfs.
 ifeq ($(IMAGE),)
-INITRAMFS_PATH := build/kerla.initramfs
+INITRAMFS_PATH := build/testing.initramfs
 export INIT_SCRIPT := /bin/sh
 else
 IMAGE_FILENAME := $(subst /,.s,$(IMAGE))
 INITRAMFS_PATH := build/$(IMAGE_FILENAME).initramfs
 export INIT_SCRIPT := $(shell tools/inspect-init-in-docker-image.py $(IMAGE))
 endif
+
+DUMMY_INITRAMFS_PATH := build/dummy-for-lint.initramfs
 
 # Set the platform name for docker image cross compiling.
 ifeq ($(ARCH),x64)
@@ -48,7 +51,7 @@ kernel_symbols := $(kernel_elf:.elf=.symbols)
 
 PROGRESS   := printf "  \\033[1;96m%8s\\033[0m  \\033[1;m%s\\033[0m\\n"
 PYTHON3    ?= python3
-CARGO      ?= cargo +nightly
+CARGO      ?= cargo
 BOCHS      ?= bochs
 NM         ?= rust-nm
 READELF    ?= readelf
@@ -116,6 +119,7 @@ run: build
 		$(if $(KVM),--kvm,)                                            \
 		$(if $(GDB),--gdb,)                                            \
 		$(if $(LOG),--append-cmdline "log=$(LOG)",)                    \
+		$(if $(CMDLINE),--append-cmdline "$(CMDLINE)",)                \
 		$(if $(LOG_SERIAL),--log-serial "$(LOG_SERIAL)",)              \
 		$(if $(QEMU),--qemu $(QEMU),)                                  \
 		$(kernel_elf) -- $(QEMU_ARGS)
@@ -135,9 +139,8 @@ testw:
 
 .PHONY: check
 check:
-	mkdir -p $(dir $(INITRAMFS_PATH))
-	touch $(INITRAMFS_PATH)
-	$(CARGO) check $(CARGOFLAGS)
+	$(MAKE) $(DUMMY_INITRAMFS_PATH)
+	INITRAMFS_PATH=$(DUMMY_INITRAMFS_PATH) $(CARGO) check $(CARGOFLAGS)
 
 .PHONY: checkw
 checkw:
@@ -164,15 +167,18 @@ src-docs:
 
 .PHONY: lint
 lint:
-	RUSTFLAGS="-C panic=abort -Z panic_abort_tests" $(CARGO) clippy
+	$(MAKE) $(DUMMY_INITRAMFS_PATH)
+	INITRAMFS_PATH=$(DUMMY_INITRAMFS_PATH) RUSTFLAGS="-C panic=abort -Z panic_abort_tests" $(CARGO) clippy
 
 .PHONY: strict-lint
 strict-lint:
-	RUSTFLAGS="-C panic=abort -Z panic_abort_tests" $(CARGO) clippy -- -D warnings
+	$(MAKE) $(DUMMY_INITRAMFS_PATH)
+	INITRAMFS_PATH=$(DUMMY_INITRAMFS_PATH) RUSTFLAGS="-C panic=abort -Z panic_abort_tests" $(CARGO) clippy -- -D warnings
 
 .PHONY: lint-and-fix
 lint-and-fix:
-	RUSTFLAGS="-C panic=abort -Z panic_abort_tests" $(CARGO) clippy --fix -Z unstable-options
+	$(MAKE) $(DUMMY_INITRAMFS_PATH)
+	INITRAMFS_PATH=$(DUMMY_INITRAMFS_PATH) RUSTFLAGS="-C panic=abort -Z panic_abort_tests" $(CARGO) clippy --fix -Z unstable-options
 
 .PHONY: print-stack-sizes
 print-stack-sizes: build
@@ -186,7 +192,7 @@ clean:
 #
 #  Build Rules
 #
-build/kerla.initramfs: $(wildcard initramfs/*) $(wildcard initramfs/*/*) Makefile
+build/testing.initramfs: $(wildcard testing/*) $(wildcard testing/*/*) Makefile
 	$(PROGRESS) "BUILD" testing
 	cd testing && docker buildx build --platform $(docker_platform) -t kerla-testing .
 	$(PROGRESS) "EXPORT" testing
@@ -197,6 +203,10 @@ build/$(IMAGE_FILENAME).initramfs: tools/docker2initramfs.py Makefile
 	$(PROGRESS) "EXPORT" $(IMAGE)
 	mkdir -p build
 	$(PYTHON3) tools/docker2initramfs.py $@ $(IMAGE)
+
+$(DUMMY_INITRAMFS_PATH):
+	mkdir -p $(@D)
+	touch $@
 
 %.svg: %.drawio
 	$(PROGRESS) "DRAWIO" $@

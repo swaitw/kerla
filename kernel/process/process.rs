@@ -1,8 +1,9 @@
 use crate::{
-    arch::{self, KERNEL_STACK_SIZE, USER_STACK_TOP},
+    arch::{self, USER_STACK_TOP},
     ctypes::*,
     fs::{
         devfs::SERIAL_TTY,
+        inode::FileLike,
         mount::RootFs,
         opened_file::{Fd, OpenFlags, OpenOptions, OpenedFile, OpenedFileTable, PathComponent},
         path::Path,
@@ -26,9 +27,9 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use atomic_refcell::{AtomicRef, AtomicRefCell};
-use core::cmp::max;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, Ordering};
+use core::{cmp::max, sync::atomic::AtomicUsize};
 use crossbeam::atomic::AtomicCell;
 use goblin::elf64::program_header::PT_LOAD;
 use kerla_runtime::{
@@ -36,13 +37,26 @@ use kerla_runtime::{
     page_allocator::{alloc_pages, AllocPageFlags},
     spinlock::{SpinLock, SpinLockGuard},
 };
-use kerla_utils::{alignment::align_up, bitmap::BitMap};
+use kerla_utils::alignment::align_up;
 
 type ProcessTable = BTreeMap<PId, Arc<Process>>;
 
 /// The process table. All processes are registered in with its process Id.
 pub(super) static PROCESSES: SpinLock<ProcessTable> = SpinLock::new(BTreeMap::new());
 pub(super) static EXITED_PROCESSES: SpinLock<Vec<Arc<Process>>> = SpinLock::new(Vec::new());
+
+static FORK_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+pub struct Stats {
+    pub fork_total: usize,
+}
+
+pub fn read_process_stats() -> Stats {
+    Stats {
+        fork_total: FORK_TOTAL.load(Ordering::SeqCst),
+    }
+}
 
 /// Returns an unused PID. Note that this function does not reserve the PID:
 /// keep the process table locked until you insert the process into the table!
@@ -102,9 +116,9 @@ pub struct Process {
     cmdline: AtomicRefCell<Cmdline>,
     children: SpinLock<Vec<Arc<Process>>>,
     vm: AtomicRefCell<Option<Arc<SpinLock<Vm>>>>,
-    opened_files: SpinLock<OpenedFileTable>,
+    opened_files: Arc<SpinLock<OpenedFileTable>>,
     root_fs: Arc<SpinLock<RootFs>>,
-    signals: SpinLock<SignalDelivery>,
+    signals: Arc<SpinLock<SignalDelivery>>,
     signaled_frame: AtomicCell<Option<PtRegs>>,
     sigset: SpinLock<SigSet>,
 }
@@ -127,10 +141,10 @@ impl Process {
             vm: AtomicRefCell::new(None),
             pid: PId::new(0),
             root_fs: INITIAL_ROOT_FS.clone(),
-            opened_files: SpinLock::new(OpenedFileTable::new()),
-            signals: SpinLock::new(SignalDelivery::new()),
+            opened_files: Arc::new(SpinLock::new(OpenedFileTable::new())),
+            signals: Arc::new(SpinLock::new(SignalDelivery::new())),
             signaled_frame: AtomicCell::new(None),
-            sigset: SpinLock::new(BitMap::zeroed()),
+            sigset: SpinLock::new(SigSet::ZERO),
         });
 
         process_group.lock().add(Arc::downgrade(&proc));
@@ -176,8 +190,6 @@ impl Process {
 
         let entry = setup_userspace(executable_path, argv, &[], &root_fs)?;
         let pid = PId::new(1);
-        let stack_bottom = alloc_pages(KERNEL_STACK_SIZE / PAGE_SIZE, AllocPageFlags::KERNEL)?;
-        let kernel_sp = stack_bottom.as_vaddr().add(KERNEL_STACK_SIZE);
         let process_group = ProcessGroup::new(PgId::new(1));
         let process = Arc::new(Process {
             is_idle: false,
@@ -187,13 +199,13 @@ impl Process {
             children: SpinLock::new(Vec::new()),
             state: AtomicCell::new(ProcessState::Runnable),
             cmdline: AtomicRefCell::new(Cmdline::from_argv(argv)),
-            arch: arch::Process::new_user_thread(entry.ip, entry.user_sp, kernel_sp),
+            arch: arch::Process::new_user_thread(entry.ip, entry.user_sp),
             vm: AtomicRefCell::new(Some(Arc::new(SpinLock::new(entry.vm)))),
-            opened_files: SpinLock::new(opened_files),
+            opened_files: Arc::new(SpinLock::new(opened_files)),
             root_fs,
-            signals: SpinLock::new(SignalDelivery::new()),
+            signals: Arc::new(SpinLock::new(SignalDelivery::new())),
             signaled_frame: AtomicCell::new(None),
-            sigset: SpinLock::new(BitMap::zeroed()),
+            sigset: SpinLock::new(SigSet::ZERO),
         });
 
         process_group.lock().add(Arc::downgrade(&process));
@@ -260,7 +272,7 @@ impl Process {
     }
 
     /// The ppened files table.
-    pub fn opened_files(&self) -> &SpinLock<OpenedFileTable> {
+    pub fn opened_files(&self) -> &Arc<SpinLock<OpenedFileTable>> {
         &self.opened_files
     }
 
@@ -390,15 +402,16 @@ impl Process {
         let mut sigset = self.sigset.lock();
 
         if let Some(old) = oldset {
-            old.write_bytes(sigset.as_slice())?;
+            old.write_bytes(sigset.as_raw_slice())?;
         }
 
         if let Some(new) = set {
             let new_set = new.read::<[u8; 128]>()?;
+            let new_set = SigSet::new(new_set);
             match how {
-                SignalMask::Block => sigset.assign_or(new_set),
-                SignalMask::Unblock => sigset.assign_and_not(new_set),
-                SignalMask::Set => sigset.assign(new_set),
+                SignalMask::Block => *sigset |= new_set,
+                SignalMask::Unblock => *sigset &= !new_set,
+                SignalMask::Set => *sigset = new_set,
             }
         }
 
@@ -413,7 +426,7 @@ impl Process {
         let current = current_process();
         if let Some((signal, sigaction)) = current.signals.lock().pop_pending() {
             let sigset = current.sigset.lock();
-            if !sigset.get(signal as usize).unwrap_or(true) {
+            if !sigset.get(signal as usize).as_deref().unwrap_or(&true) {
                 match sigaction {
                     SigAction::Ignore => {}
                     SigAction::Terminate => {
@@ -487,7 +500,7 @@ impl Process {
         let pid = alloc_pid(&mut process_table)?;
         let arch = parent.arch.fork(parent_frame)?;
         let vm = parent.vm().as_ref().unwrap().lock().fork()?;
-        let opened_files = parent.opened_files().lock().fork();
+        let opened_files = parent.opened_files().lock().clone(); // TODO: #88 has to address this
         let process_group = parent.process_group();
         let sig_set = parent.sigset.lock();
 
@@ -500,18 +513,20 @@ impl Process {
             cmdline: AtomicRefCell::new(parent.cmdline().clone()),
             children: SpinLock::new(Vec::new()),
             vm: AtomicRefCell::new(Some(Arc::new(SpinLock::new(vm)))),
-            opened_files: SpinLock::new(opened_files),
+            opened_files: Arc::new(SpinLock::new(opened_files)),
             root_fs: parent.root_fs().clone(),
             arch,
-            signals: SpinLock::new(SignalDelivery::new()),
+            signals: Arc::new(SpinLock::new(SignalDelivery::new())), // TODO: #88 has to address this
             signaled_frame: AtomicCell::new(None),
-            sigset: SpinLock::new(sig_set.clone()),
+            sigset: SpinLock::new(*sig_set),
         });
 
         process_group.lock().add(Arc::downgrade(&child));
         parent.children().push(child.clone());
         process_table.insert(pid, child.clone());
         SCHEDULER.lock().enqueue(pid);
+
+        FORK_TOTAL.fetch_add(1, Ordering::Relaxed);
         Ok(child)
     }
 }
@@ -546,44 +561,49 @@ fn setup_userspace(
     do_setup_userspace(executable_path, argv, envp, root_fs, true)
 }
 
-/// Creates a new virtual memory space, parses and maps an executable file,
-/// and set up the user stack.
-fn do_setup_userspace(
-    executable_path: Arc<PathComponent>,
-    argv: &[&[u8]],
+fn do_script_binfmt(
+    executable_path: &Arc<PathComponent>,
+    script_argv: &[&[u8]],
     envp: &[&[u8]],
     root_fs: &Arc<SpinLock<RootFs>>,
-    handle_shebang: bool,
+    buf: &[u8],
 ) -> Result<UserspaceEntry> {
-    // Read the ELF header in the executable file.
-    let file_header_len = PAGE_SIZE;
-    let file_header_top = USER_STACK_TOP;
-    let file_header_pages = alloc_pages(file_header_len / PAGE_SIZE, AllocPageFlags::KERNEL)?;
-    let buf =
-        unsafe { core::slice::from_raw_parts_mut(file_header_pages.as_mut_ptr(), file_header_len) };
-
-    let executable = executable_path.inode.as_file()?;
-    executable.read(0, buf.into(), &OpenOptions::readwrite())?;
-
-    if handle_shebang && buf.starts_with(b"#!") && buf.contains(&b'\n') {
-        let mut argv: Vec<&[u8]> = buf[2..buf.iter().position(|&ch| ch == b'\n').unwrap()]
-            .split(|&ch| ch == b' ')
-            .collect();
-        if argv.is_empty() {
-            return Err(Errno::EINVAL.into());
-        }
-
-        let executable_pathbuf = executable_path.resolve_absolute_path();
-        argv.push(executable_pathbuf.as_str().as_bytes());
-
-        let shebang_path = root_fs.lock().lookup_path(
-            Path::new(core::str::from_utf8(argv[0]).map_err(|_| Error::new(Errno::EINVAL))?),
-            true,
-        )?;
-
-        return do_setup_userspace(shebang_path, &argv, envp, root_fs, false);
+    // Set up argv[] with the interpreter and its arguments from the shebang line.
+    let mut argv: Vec<&[u8]> = buf[2..buf.iter().position(|&ch| ch == b'\n').unwrap()]
+        .split(|&ch| ch == b' ')
+        .collect();
+    if argv.is_empty() {
+        return Err(Errno::EINVAL.into());
     }
 
+    // Push the path to the script file as the first argument to the
+    // interpreter.
+    let executable_pathbuf = executable_path.resolve_absolute_path();
+    argv.push(executable_pathbuf.as_str().as_bytes());
+
+    // Push the original arguments to the script on after the new script
+    // invocation (leaving out argv[0] of the previous path of invoking the
+    // script.)
+    for arg in script_argv.iter().skip(1) {
+        argv.push(arg);
+    }
+
+    let shebang_path = root_fs.lock().lookup_path(
+        Path::new(core::str::from_utf8(argv[0]).map_err(|_| Error::new(Errno::EINVAL))?),
+        true,
+    )?;
+
+    do_setup_userspace(shebang_path, &argv, envp, root_fs, false)
+}
+
+fn do_elf_binfmt(
+    executable: &Arc<dyn FileLike>,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    file_header_pages: kerla_api::address::PAddr,
+    buf: &[u8],
+) -> Result<UserspaceEntry> {
+    let file_header_top = USER_STACK_TOP;
     let elf = Elf::parse(buf)?;
     let ip = elf.entry()?;
 
@@ -601,7 +621,7 @@ fn do_setup_userspace(
     let auxv = &[
         Auxv::Phdr(
             file_header_top
-                .sub(file_header_len)
+                .sub(buf.len())
                 .add(elf.header().e_phoff as usize),
         ),
         Auxv::Phnum(elf.program_headers().len()),
@@ -610,7 +630,7 @@ fn do_setup_userspace(
         Auxv::Random(random_bytes),
     ];
     const USER_STACK_LEN: usize = 128 * 1024; // TODO: Implement rlimit
-    let init_stack_top = file_header_top.sub(file_header_len);
+    let init_stack_top = file_header_top.sub(buf.len());
     let user_stack_bottom = init_stack_top.sub(USER_STACK_LEN).value();
     let user_heap_bottom = align_up(end_of_image, PAGE_SIZE);
     let init_stack_len = align_up(estimate_user_init_stack_size(argv, envp, auxv), PAGE_SIZE);
@@ -632,9 +652,9 @@ fn do_setup_userspace(
         UserVAddr::new(user_stack_bottom).unwrap(),
         UserVAddr::new(user_heap_bottom).unwrap(),
     )?;
-    for i in 0..(file_header_len / PAGE_SIZE) {
+    for i in 0..(buf.len() / PAGE_SIZE) {
         vm.page_table_mut().map_user_page(
-            file_header_top.sub(((file_header_len / PAGE_SIZE) - i) * PAGE_SIZE),
+            file_header_top.sub(((buf.len() / PAGE_SIZE) - i) * PAGE_SIZE),
             file_header_pages.add(i * PAGE_SIZE),
         );
     }
@@ -670,6 +690,31 @@ fn do_setup_userspace(
     }
 
     Ok(UserspaceEntry { vm, ip, user_sp })
+}
+
+/// Creates a new virtual memory space, parses and maps an executable file,
+/// and set up the user stack.
+fn do_setup_userspace(
+    executable_path: Arc<PathComponent>,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    root_fs: &Arc<SpinLock<RootFs>>,
+    handle_shebang: bool,
+) -> Result<UserspaceEntry> {
+    // Read the ELF header in the executable file.
+    let file_header_len = PAGE_SIZE;
+    let file_header_pages = alloc_pages(file_header_len / PAGE_SIZE, AllocPageFlags::KERNEL)?;
+    let buf =
+        unsafe { core::slice::from_raw_parts_mut(file_header_pages.as_mut_ptr(), file_header_len) };
+
+    let executable = executable_path.inode.as_file()?;
+    executable.read(0, buf.into(), &OpenOptions::readwrite())?;
+
+    if handle_shebang && buf.starts_with(b"#!") && buf.contains(&b'\n') {
+        return do_script_binfmt(&executable_path, argv, envp, root_fs, buf);
+    }
+
+    do_elf_binfmt(executable, argv, envp, file_header_pages, buf)
 }
 
 pub fn gc_exited_processes() {

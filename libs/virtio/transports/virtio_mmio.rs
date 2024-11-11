@@ -17,11 +17,15 @@ impl VirtioMmio {
 }
 
 impl VirtioTransport for VirtioMmio {
+    fn is_modern(&self) -> bool {
+        true
+    }
+
     fn read_device_config8(&self, offset: u16) -> u8 {
         unsafe {
             self.mmio_base
                 .add((0x100 + offset) as usize)
-                .read_volatile::<u8>() as u8
+                .read_volatile::<u8>()
         }
     }
 

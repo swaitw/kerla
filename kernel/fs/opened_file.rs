@@ -1,3 +1,6 @@
+// Allow the bad bit mask of O_RDONLY
+#![allow(clippy::bad_bit_mask)]
+
 use super::{
     inode::{DirEntry, Directory, FileLike, INode},
     path::PathBuf,
@@ -425,11 +428,6 @@ impl OpenedFileTable {
 
         self.open_with_fixed_fd(new, opened_file, options)?;
         Ok(())
-    }
-
-    /// Clones the table.
-    pub fn fork(&self) -> OpenedFileTable {
-        self.clone()
     }
 
     /// Closes all opened files.

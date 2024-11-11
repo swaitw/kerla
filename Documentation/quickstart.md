@@ -1,7 +1,7 @@
 # Quickstart
 
 ### Prerequisites
-Make sure you the following softwares are installed:
+Make sure the following software is installed:
 
 - Rust toolchain (nightly) - Use [rustup](https://rustup.rs/) to install
 - [cargo-binutils](https://crates.io/crates/cargo-binutils) and [rustfilt](https://crates.io/crates/rustfilt) crates
@@ -38,11 +38,12 @@ $ make
 $ make                # Build OS (debug build)
 $ make RELEASE=1      # Build OS (release build)
 $ make run            # Run on QEMU
+$ make run LOG=trace  # Run on QEMU w/ trace messages enabled
 $ make run GDB=1      # Run on QEMU with GDB connection enabled (listens on localhost:7789)
 ```
 
 ### Running OS on QEMU
-Once you boot the OS by `make run`, a Busybox shell shows up in your terminal.
+Once you boot the OS with `make run`, a Busybox shell shows up in your terminal.
 
 The terminal running QEMU emulates a serial port connected to Kerla. What you type on
 the terminal will be sent to the Kerla and the foreground process.
